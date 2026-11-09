@@ -1,161 +1,148 @@
 # Parchís Web
 
-Aplicación web de **Parchís para 2, 3 o 4 jugadores**, desarrollada como proyecto universitario con React, TypeScript, Vite, NestJS y Socket.IO.
+Aplicación web de Parchís para 2, 3 o 4 jugadores. Incluye lobby, juego en tiempo real con estado autoritativo en el backend y videollamadas mediante el SFU MeetSpace del Grupo B.
 
-El servidor conserva el estado de las salas y de las partidas en memoria. No utiliza base de datos ni almacena partidas después de reiniciar el backend.
+El estado de salas y partidas se conserva en memoria: no hay base de datos ni persistencia después de reiniciar el backend del juego.
 
-## Estado de videollamadas
+## Componentes
 
-> Esta versión **no incluye un sistema SFU ni videollamada funcional**.
+- `frontend/`: React, TypeScript, Vite, Zustand, Framer Motion, Socket.IO Client y mediasoup-client.
+- `backend/`: NestJS y Socket.IO; gestiona salas, reglas y partidas.
+- `SFU/backend/`: servicio MeetSpace con mediasoup 3 y Socket.IO, independiente del backend del juego.
 
-Las esquinas de la interfaz muestran recuadros de cámara como interfaz preparada para una futura integración con el SFU, pero no capturan ni transmiten audio o vídeo. Los recuadros pueden integrarse posteriormente sin modificar las reglas ni el diseño del tablero.
-
-## Funcionalidades
-
-- Lobby con listado, creación y unión a salas.
-- Partidas de 2, 3 o 4 jugadores.
-- Tablero SVG de 19 × 19.
-- Estado del juego validado por el backend.
-- Dados, movimientos, turnos, capturas, salida, meta, bonus y castigo por tres seises.
-- Animaciones de movimiento, captura, vuelo a casa, meta y castigo.
-- Cuenta regresiva antes de comenzar.
-- Salida de salas en espera, cuenta regresiva, partida y victoria.
-- Cuatro posiciones de cámara fijas por color.
-- Vista de depuración en `?debug=1`.
-
-## Tecnologías
-
-### Frontend
-
-- React
-- TypeScript
-- Vite
-- Zustand
-- Socket.IO Client
-- Framer Motion
-
-### Backend
-
-- NestJS
-- Socket.IO
-- WebSocket Gateway
-- Estado en memoria mediante `Map`
+El código del juego permanece en `backend/` y `frontend/`; el SFU se ejecuta por separado desde `SFU/backend/`.
 
 ## Requisitos
 
-- Node.js 20 o superior.
+- Node.js compatible con las dependencias de cada paquete (se recomienda Node 22 o superior).
 - npm.
+- Cámara y micrófono para probar audio/video. Los permisos se solicitan al activar cada control.
 
 ## Instalación
 
-Desde la raíz del proyecto:
-
-```powershell
-cd frontend
-npm install
-cd ..\backend
-npm install
-cd ..
-```
-
-## Ejecución local
-
-### Backend
+Instala cada paquete en su propio directorio:
 
 ```powershell
 cd backend
+npm install
+cd ..\frontend
+npm install
+cd ..\SFU\backend
+npm install
+```
+
+Configura el SFU:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+En `SFU/backend/.env`, configura:
+
+```env
+PORT=4000
+MEDIASOUP_ANNOUNCED_ADDRESS=127.0.0.1
+```
+
+Usa `127.0.0.1` si navegador, juego y SFU se prueban en el mismo equipo. Para clientes en otros equipos de la red, reemplázalo por la IP LAN del equipo que ejecuta el SFU. No publiques el archivo `.env`.
+
+## Arranque local
+
+Arranca cada componente en su propia terminal.
+
+**1. Backend del juego** — desde `backend/`:
+
+```powershell
 npm run start:dev
 ```
 
-El backend estará disponible en `http://localhost:3000`.
+Socket.IO en el puerto `3000`.
 
-### Frontend
-
-En otra terminal:
+**2. SFU MeetSpace** — desde `SFU/backend/`:
 
 ```powershell
-cd frontend
+npm start
+```
+
+Señalización Socket.IO y health check en el puerto `4000`; health check en `http://localhost:4000/api/health`.
+
+**3. Frontend** — desde `frontend/`:
+
+```powershell
 npm run dev -- --host
 ```
 
-El frontend normalmente estará disponible en `http://localhost:5173`.
+Vite normalmente sirve la página en `http://localhost:5173`.
 
-## Configuración del frontend
+### Puertos
 
-Por defecto, el cliente se conecta a `http://localhost:3000`.
+| Puerto | Uso |
+|---|---|
+| 3000/TCP | Backend del juego y Socket.IO |
+| 4000/TCP | SFU MeetSpace, Socket.IO y `/api/health` |
+| 40000–40099/UDP y TCP | Medios WebRTC de mediasoup |
+| 5173/TCP | Servidor de desarrollo Vite |
 
-Para utilizar otra URL del backend, crea `frontend/.env.local`:
+## Variables de entorno del frontend
+
+Se pueden definir en `frontend/.env.local`:
 
 ```env
 VITE_BACKEND_URL=http://localhost:3000
+VITE_SFU_URL=http://localhost:4000
 ```
 
-También puede habilitarse el servidor local simulado:
+`VITE_SFU_URL` tiene por defecto `http://localhost:4000`. Para probar la interfaz de llamada sin iniciar MeetSpace:
 
 ```env
-VITE_USE_MOCK=true
+VITE_SFU_MOCK=true
 ```
+
+El modo simulado muestra streams de video generados localmente; no transmite audio/video real. `VITE_USE_MOCK=true` es otro modo, independiente, que simula el servidor de salas/juego.
+
+## Videollamada y contrato
+
+La llamada se une usando el `roomId` del juego. El campo `participant` del protocolo del Grupo B es una cadena, así que se envía como `color|id|nombre`; no se cambió la forma de `join-room`. El color determina la esquina a la que se asocia cada stream.
+
+Los botones de cámara y micrófono comienzan apagados. Al activarlos, la página solicita el permiso correspondiente. Si el SFU está desconectado o se deniega un permiso, se informa al usuario y el juego sigue funcionando.
+
+Contrato confirmado leyendo el servidor: [docs/sfu-contrato.md](./docs/sfu-contrato.md). Cambio aditivo del backend SFU para cerrar producers al apagar dispositivos: [docs/cambios-sfu.md](./docs/cambios-sfu.md).
+
+## Pruebas y builds
+
+Frontend:
+
+```powershell
+cd frontend
+npm test
+npm run build
+```
+
+Backend del juego:
+
+```powershell
+cd backend
+npm test
+npm run build
+```
+
+Modo de depuración del tablero: `http://localhost:5173/sala/<id>?debug=1`.
 
 ## Estructura
 
 ```text
 .
-├── frontend/
-│   ├── src/
-│   │   ├── pages/       # Lobby, creación de sala y partida
-│   │   ├── services/    # Socket.IO y servidor mock
-│   │   ├── store/       # Estado de sala con Zustand
-│   │   └── types/       # Tipos compartidos del cliente
-│   └── package.json
-├── backend/
-│   ├── src/
-│   │   ├── rooms/       # Salas, jugadores y ocupación
-│   │   └── game/        # Reglas, estado y WebSocket
-│   └── package.json
+├── backend/       # Juego y salas
+├── frontend/      # Interfaz, cliente de juego y cliente aislado del SFU
+├── SFU/backend/   # MeetSpace / mediasoup
+├── docs/          # Contrato e integración del SFU
 └── README.md
 ```
 
-## Pruebas y construcción
+## Paquetes npm en la raíz
 
-### Frontend
+El `package.json` y `package-lock.json` de la raíz solo se usaban para Vitest; no tienen scripts para arrancar los tres servicios. Vitest ya está declarado en `frontend/package.json`, por lo que esos manifiestos raíz y el `node_modules/` raíz no son necesarios para instalar, probar ni ejecutar el proyecto. Se recomienda retirarlos en una limpieza posterior; por ahora se conservan.
 
-```powershell
-cd frontend
-npm test
-npm run build
-```
+## Alcance
 
-### Backend
-
-```powershell
-cd backend
-npm test
-npm run build
-```
-
-## Modo de depuración
-
-Abre el tablero con:
-
-```text
-http://localhost:5173/sala/<id-de-sala>?debug=1
-```
-
-Este modo permite probar movimientos, salida, captura, llegada a meta y castigo sin completar una partida.
-
-## Limitaciones actuales
-
-- No hay base de datos; las salas y partidas se pierden al reiniciar el backend.
-- No hay persistencia, autenticación ni cuentas de usuario.
-- No existe integración WebRTC ni SFU.
-- Los controles de cámara y micrófono son visuales hasta que se integre el sistema externo.
-- El protocolo y la señalización del SFU deberán acordarse posteriormente con el Grupo B.
-
-## Despliegue previsto
-
-El despliegue local previsto consiste en:
-
-- Frontend servido por Nginx desde `frontend/dist`.
-- Backend NestJS ejecutado con systemd o PM2.
-- Socket.IO servido detrás del proxy WebSocket de Nginx.
-- HTTPS local para permitir acceso a cámara y micrófono en navegadores.
+El SFU es exclusivamente para pruebas locales. Nginx, HTTPS/WSS, firewall y despliegue en Debian quedan fuera de esta integración.

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
 import { Navigate, useNavigate, useParams } from 'react-router-dom'
 import { motion, useReducedMotion } from 'framer-motion'
 import { roomService } from '../../services/roomService'
 import { useRoomStore } from '../../store/roomStore'
+import { callClient, type CallParticipant, type CallReaction } from '../../services/sfu'
 import { ANIMATION_CONFIG } from './animation.config'
 import {
   SAFE_SQUARES,
@@ -14,6 +15,89 @@ import {
   type BoardColor,
 } from './board-mapping'
 import './GamePage.css'
+
+function ParticipantMedia({
+  participant,
+  showVideo,
+  onPlaybackBlocked,
+}: {
+  participant: CallParticipant | undefined
+  showVideo: boolean
+  onPlaybackBlocked: () => void
+}) {
+  const mediaRef = useRef<HTMLVideoElement | HTMLAudioElement | null>(null)
+  const [needsGesture, setNeedsGesture] = useState(false)
+
+  useEffect(() => {
+    const element = mediaRef.current
+    if (!element || !participant) return
+    element.srcObject = participant.stream
+    void element.play()
+      .then(() => setNeedsGesture(false))
+      .catch(() => {
+        setNeedsGesture(!participant.isLocal)
+        if (!participant.isLocal) onPlaybackBlocked()
+      })
+    return () => {
+      element.srcObject = null
+    }
+  }, [participant, showVideo, onPlaybackBlocked])
+
+  if (!participant) return null
+  const muted = participant.isLocal
+  return showVideo
+    ? (
+      <video
+        ref={(element) => { mediaRef.current = element }}
+        className={`participant-video${muted ? ' mirrored' : ''}`}
+        autoPlay
+        playsInline
+        muted={muted}
+        onClick={() => {
+          void mediaRef.current?.play()
+            .then(() => setNeedsGesture(false))
+            .catch(onPlaybackBlocked)
+        }}
+      />
+    )
+    : (
+      <>
+        <audio
+          ref={(element) => { mediaRef.current = element }}
+          autoPlay
+          muted={muted}
+          style={{ display: 'none' }}
+        />
+        {!muted && needsGesture && (
+          <button
+            className="audio-unlock"
+            type="button"
+            onClick={() => {
+              void mediaRef.current?.play()
+                .then(() => setNeedsGesture(false))
+                .catch(onPlaybackBlocked)
+            }}
+          >
+            Activar audio
+          </button>
+        )}
+      </>
+    )
+}
+
+function cleanupCallEffect(
+  generationRef: { current: number },
+  reactionTimersRef: { current: Map<BoardColor, number> },
+  unsubscriptions: Array<() => void>,
+) {
+  unsubscriptions.forEach((unsubscribe) => unsubscribe())
+  for (const timer of reactionTimersRef.current.values()) window.clearTimeout(timer)
+  reactionTimersRef.current.clear()
+  const cleanupGeneration = ++generationRef.current
+  queueMicrotask(() => {
+    if (generationRef.current === cleanupGeneration) callClient.leave()
+  })
+}
 
 const BOARD_MARGIN = 10
 
@@ -96,10 +180,15 @@ function GamePage() {
   const navigate = useNavigate()
   const currentRoomId = useRoomStore((state) => state.currentRoomId)
   const playerName = useRoomStore((state) => state.playerName)
-  const [micOn, setMicOn] = useState(true)
-  const [cameraOn, setCameraOn] = useState(true)
+  const [micOn, setMicOn] = useState(false)
+  const [cameraOn, setCameraOn] = useState(false)
   const [reaction, setReaction] = useState<string | null>(null)
   const [playerNames, setPlayerNames] = useState<string[]>([])
+  const [confirmedRoomId, setConfirmedRoomId] = useState<string | null>(null)
+  const [callParticipants, setCallParticipants] = useState<CallParticipant[]>([])
+  const [sfuNotice, setSfuNotice] = useState<string | null>(null)
+  const [permissionDeniedFor, setPermissionDeniedFor] = useState<'audio' | 'video' | null>(null)
+  const [floatingReactions, setFloatingReactions] = useState<Partial<Record<BoardColor, string>>>({})
   const [hostName, setHostName] = useState<string | null>(null)
   const [phase, setPhase] = useState<'waiting' | 'countdown' | 'playing' | 'finished'>('waiting')
   const [startError, setStartError] = useState('')
@@ -127,11 +216,37 @@ function GamePage() {
   const processingRef = useRef(false)
   const stateSettleTimerRef = useRef<number | null>(null)
   const leavingRef = useRef(false)
+  const callGenerationRef = useRef(0)
+  const callIdentityRef = useRef<string | null>(null)
+  const reactionTimersRef = useRef(new Map<BoardColor, number>())
+
+  const assignedColors: GamePiece['color'][] = playerNames.length === 2
+    ? ['red', 'yellow']
+    : playerNames.length === 3
+      ? ['red', 'blue', 'yellow']
+      : ['red', 'blue', 'yellow', 'green']
+  const myPlayerIndex = playerNames.findIndex((name) => name === playerName)
+  const myColor = myPlayerIndex >= 0 ? assignedColors[myPlayerIndex] : undefined
 
   const showToast = (message: string) => {
     setToastMessage(message)
     window.setTimeout(() => setToastMessage((current) => current === message ? null : current), ANIMATION_CONFIG.toastDurationMs)
   }
+
+  const handlePlaybackBlocked = useCallback(() => {
+    setSfuNotice('El navegador bloqueó la reproducción. Haz clic en el video para activarla.')
+  }, [])
+
+  const handleCallReaction = useCallback((payload: CallReaction) => {
+    setFloatingReactions((current) => ({ ...current, [payload.color]: payload.type }))
+    const existingTimer = reactionTimersRef.current.get(payload.color)
+    if (existingTimer !== undefined) window.clearTimeout(existingTimer)
+    const timer = window.setTimeout(() => {
+      setFloatingReactions((current) => ({ ...current, [payload.color]: undefined }))
+      reactionTimersRef.current.delete(payload.color)
+    }, 1800)
+    reactionTimersRef.current.set(payload.color, timer)
+  }, [])
 
   const replaceDisplayedState = (state: GameState) => {
     const copy = { ...state, pieces: state.pieces.map((piece) => ({ ...piece })), turn: { ...state.turn, legalMoves: state.turn.legalMoves.map((move) => ({ ...move })) } }
@@ -300,6 +415,7 @@ function GamePage() {
       setPlayerNames(state.players)
       setHostName(state.hostName)
       setPhase(state.phase)
+      setConfirmedRoomId(state.players.includes(playerName.trim()) ? roomId : null)
     })
     const unsubscribeGame = roomService.subscribeGame(roomId, {
       onState: (state) => {
@@ -345,7 +461,54 @@ function GamePage() {
       unsubscribeGame()
       if (stateSettleTimerRef.current) window.clearTimeout(stateSettleTimerRef.current)
     }
-  }, [roomId])
+  }, [roomId, playerName])
+
+  useEffect(() => {
+    if (!roomId || confirmedRoomId !== roomId || !myColor || !playerName.trim()) return
+
+    const generation = ++callGenerationRef.current
+    const unsubscriptions = [
+      callClient.on('participants', (participants) => {
+        setCallParticipants(participants)
+        const local = participants.find((participant) => participant.id === callIdentityRef.current)
+        setMicOn(local?.micOn ?? false)
+        setCameraOn(local?.camOn ?? false)
+      }),
+      callClient.on('state', ({ state, message }) => {
+        if (state === 'joined') {
+          setSfuNotice(null)
+          setPermissionDeniedFor(null)
+        }
+        else if (state === 'unavailable' || state === 'disconnected' || state === 'permission-denied') {
+          setSfuNotice(message ?? 'La videollamada no está disponible; puedes continuar jugando.')
+        }
+      }),
+      callClient.on('reaction', handleCallReaction),
+      callClient.on('error', (error) => {
+        setSfuNotice(error.message)
+        if (error.message.includes('Sin permiso para acceder al micrófono')) setPermissionDeniedFor('audio')
+        else if (error.message.includes('Sin permiso para acceder a la cámara')) setPermissionDeniedFor('video')
+      }),
+    ]
+
+    if (!callIdentityRef.current) {
+      callIdentityRef.current = crypto.randomUUID().replaceAll('-', '').slice(0, 8)
+    }
+    const identity = {
+      id: callIdentityRef.current,
+      name: playerName.trim(),
+      color: myColor,
+    }
+    void callClient.join(roomId, identity).catch((error: unknown) => {
+      if (generation === callGenerationRef.current) {
+        setSfuNotice(error instanceof Error ? error.message : 'No se pudo conectar la videollamada.')
+      }
+    })
+
+    return () => {
+      cleanupCallEffect(callGenerationRef, reactionTimersRef, unsubscriptions)
+    }
+  }, [roomId, confirmedRoomId, myColor, playerName, handleCallReaction])
 
   const rollDie = () => {
     if (!roomId) return
@@ -381,6 +544,13 @@ function GamePage() {
     leavingRef.current = true
     console.log('[room:leave] Saliendo de la sala', roomId)
     void roomService.leaveRoom(roomId, playerName)
+    callClient.leave()
+    setCallParticipants([])
+    setSfuNotice(null)
+    setPermissionDeniedFor(null)
+    setMicOn(false)
+    setCameraOn(false)
+    setConfirmedRoomId(null)
     setPhase('waiting')
     setGameState(null)
     setDisplayedState(null)
@@ -411,13 +581,28 @@ function GamePage() {
     roomService.startGameSocket(roomId, playerName)
   }
 
-  const assignedColors: GamePiece['color'][] = playerNames.length === 2
-    ? ['red', 'yellow']
-    : playerNames.length === 3
-      ? ['red', 'blue', 'yellow']
-      : ['red', 'blue', 'yellow', 'green']
-  const myPlayerIndex = playerNames.findIndex((name) => name === playerName)
-  const myColor = myPlayerIndex >= 0 ? assignedColors[myPlayerIndex] : undefined
+  const toggleMic = async () => {
+    try {
+      await callClient.toggleMic()
+    } catch (error) {
+      setSfuNotice(error instanceof Error ? error.message : 'No se pudo cambiar el micrófono.')
+    }
+  }
+
+  const toggleCamera = async () => {
+    try {
+      await callClient.toggleCamera()
+    } catch (error) {
+      setSfuNotice(error instanceof Error ? error.message : 'No se pudo cambiar la cámara.')
+    }
+  }
+
+  const sendReaction = (emoji: string) => {
+    setReaction(emoji)
+    callClient.sendReaction(emoji)
+    window.setTimeout(() => setReaction((current) => current === emoji ? null : current), 300)
+  }
+
   const turnPlayerIndex = gameState ? assignedColors.indexOf(gameState.turn.color) : -1
   const turnPlayerName = turnPlayerIndex >= 0 ? playerNames[turnPlayerIndex] : 'Jugador'
   const isMyTurn = Boolean(gameState && myColor === gameState.turn.color)
@@ -440,10 +625,18 @@ function GamePage() {
 
   return (
     <main className="game-shell">
+      {sfuNotice && <div className="sfu-notice" role="status">{sfuNotice}</div>}
       {(['red', 'blue', 'green', 'yellow'] as GamePiece['color'][]).map((playerColorName) => {
         const playerIndex = assignedColors.indexOf(playerColorName)
         const slotPlayerName = playerIndex >= 0 ? playerNames[playerIndex]?.trim() : ''
         const playerNameInSlot = slotPlayerName || 'Sin jugador'
+        const participant = callParticipants.find((item) => item.color === playerColorName)
+        const hasVideo = Boolean(
+          slotPlayerName
+          && participant?.camOn
+          && participant.stream.getVideoTracks().some((track) => track.readyState === 'live'),
+        )
+        const permissionDenied = participant?.isLocal && permissionDeniedFor === 'video'
         const playerColor = playerColorName === 'red' ? '#ef4444'
           : playerColorName === 'blue' ? '#3b82f6'
           : playerColorName === 'yellow' ? '#eab308'
@@ -453,17 +646,31 @@ function GamePage() {
           : playerColorName === 'yellow' ? 'bottom-right'
           : 'bottom-left'
         return (
-        <section className={`camera-card ${corner}${slotPlayerName ? '' : ' empty'}`} key={playerColorName}>
+        <section className={`camera-card ${corner}${slotPlayerName ? '' : ' empty'}`} key={playerColorName} data-player-color={playerColorName}>
           <div className="video-placeholder">
-            <div className="avatar" style={{ '--player-color': playerColor } as CSSProperties }>
-              {slotPlayerName ? slotPlayerName.charAt(0) : '?'}
-            </div>
-            <span className="camera-status">Cámara apagada</span>
+            <ParticipantMedia
+              participant={participant}
+              showVideo={hasVideo}
+              onPlaybackBlocked={handlePlaybackBlocked}
+            />
+            {!hasVideo && (
+              <div className="avatar" style={{ '--player-color': playerColor } as CSSProperties}>
+                {slotPlayerName ? slotPlayerName.charAt(0) : '?'}
+              </div>
+            )}
+            {floatingReactions[playerColorName] && (
+              <span className="floating-reaction" aria-label={`Reacción ${floatingReactions[playerColorName]}`}>
+                {floatingReactions[playerColorName]}
+              </span>
+            )}
+            <span className="camera-status">
+              {!slotPlayerName ? 'Sin jugador' : permissionDenied ? 'Sin permiso' : hasVideo ? 'Cámara activa' : 'Cámara apagada'}
+            </span>
           </div>
           <div className="player-label">
             <span className="player-dot" style={{ background: playerColor }} />
             <strong>{playerNameInSlot}</strong>
-            <span className="connection-dot" title="Conectado" />
+            {slotPlayerName && <span className="connection-dot" title="Conectado" />}
           </div>
         </section>
         )
@@ -898,15 +1105,15 @@ function GamePage() {
       )}
 
       <div className="interaction-bar">
-        <button className={micOn ? 'control-button' : 'control-button off'} type="button" onClick={() => setMicOn((value) => !value)} aria-label={micOn ? 'Silenciar micrófono' : 'Activar micrófono'}>
+        <button className={micOn ? 'control-button' : 'control-button off'} type="button" onClick={() => void toggleMic()} aria-label={micOn ? 'Silenciar micrófono' : 'Activar micrófono'}>
           <MicIcon active={micOn} />
         </button>
-        <button className={cameraOn ? 'control-button' : 'control-button off'} type="button" onClick={() => setCameraOn((value) => !value)} aria-label={cameraOn ? 'Apagar cámara' : 'Activar cámara'}>
+        <button className={cameraOn ? 'control-button' : 'control-button off'} type="button" onClick={() => void toggleCamera()} aria-label={cameraOn ? 'Apagar cámara' : 'Activar cámara'}>
           <CameraIcon active={cameraOn} />
         </button>
         <div className="reaction-menu" aria-label="Reacciones">
-          {['👍', '👏', '😄', '🎉'].map((emoji) => (
-            <button key={emoji} type="button" onClick={() => setReaction(reaction === emoji ? null : emoji)} className={reaction === emoji ? 'active' : ''}>
+          {['👍', '👏', '😂', '🎉'].map((emoji) => (
+            <button key={emoji} type="button" onClick={() => sendReaction(emoji)} className={reaction === emoji ? 'active' : ''}>
               {emoji}
             </button>
           ))}
